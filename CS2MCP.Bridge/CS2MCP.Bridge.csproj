@@ -1,0 +1,114 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net472</TargetFramework>
+    <LangVersion>9.0</LangVersion>
+    <AssemblyName>CS2MCP</AssemblyName>
+    <RootNamespace>CS2MCP</RootNamespace>
+    <Version>0.4.0</Version>
+    <AppendTargetFrameworkToOutputPath>false</AppendTargetFrameworkToOutputPath>
+    <!-- Cities: Skylines II install path. Resolution order (first match wins):
+         1) -p:GamePath=... on the dotnet build command line
+         2) CS2_PATH environment variable
+         3) CSII_INSTALLATIONPATH (set by the official modding toolchain)
+         4) common Steam library locations -->
+    <GamePath Condition="'$(GamePath)' == '' And '$(CS2_PATH)' != ''">$(CS2_PATH)</GamePath>
+    <GamePath Condition="'$(GamePath)' == '' And '$(CSII_INSTALLATIONPATH)' != ''">$(CSII_INSTALLATIONPATH)</GamePath>
+    <GamePath Condition="'$(GamePath)' == '' And Exists('C:\Program Files (x86)\Steam\steamapps\common\Cities Skylines II\Cities2_Data\Managed\Game.dll')">C:\Program Files (x86)\Steam\steamapps\common\Cities Skylines II</GamePath>
+    <GamePath Condition="'$(GamePath)' == '' And Exists('C:\SteamLibrary\steamapps\common\Cities Skylines II\Cities2_Data\Managed\Game.dll')">C:\SteamLibrary\steamapps\common\Cities Skylines II</GamePath>
+    <GamePath Condition="'$(GamePath)' == '' And Exists('D:\Steam\steamapps\common\Cities Skylines II\Cities2_Data\Managed\Game.dll')">D:\Steam\steamapps\common\Cities Skylines II</GamePath>
+    <GamePath Condition="'$(GamePath)' == '' And Exists('D:\SteamLibrary\steamapps\common\Cities Skylines II\Cities2_Data\Managed\Game.dll')">D:\SteamLibrary\steamapps\common\Cities Skylines II</GamePath>
+    <GamePath Condition="'$(GamePath)' == '' And Exists('E:\Steam\steamapps\common\Cities Skylines II\Cities2_Data\Managed\Game.dll')">E:\Steam\steamapps\common\Cities Skylines II</GamePath>
+    <GamePath Condition="'$(GamePath)' == '' And Exists('E:\SteamLibrary\steamapps\common\Cities Skylines II\Cities2_Data\Managed\Game.dll')">E:\SteamLibrary\steamapps\common\Cities Skylines II</GamePath>
+    <ManagedDLLPath>$(GamePath)\Cities2_Data\Managed</ManagedDLLPath>
+    <!-- 本地 mod 部署目录（游戏会从这里加载） -->
+    <ModDeployPath>$(LOCALAPPDATA)Low\Colossal Order\Cities Skylines II\Mods\CS2MCP</ModDeployPath>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Microsoft.NETFramework.ReferenceAssemblies" Version="1.0.3" PrivateAssets="all" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <Reference Include="Game">
+      <HintPath>$(ManagedDLLPath)\Game.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="Colossal.Core">
+      <HintPath>$(ManagedDLLPath)\Colossal.Core.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="Colossal.Logging">
+      <HintPath>$(ManagedDLLPath)\Colossal.Logging.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="Colossal.Localization">
+      <HintPath>$(ManagedDLLPath)\Colossal.Localization.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="Colossal.IO.AssetDatabase">
+      <HintPath>$(ManagedDLLPath)\Colossal.IO.AssetDatabase.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="Colossal.Collections">
+      <HintPath>$(ManagedDLLPath)\Colossal.Collections.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="Colossal.Mathematics">
+      <HintPath>$(ManagedDLLPath)\Colossal.Mathematics.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="Unity.Entities">
+      <HintPath>$(ManagedDLLPath)\Unity.Entities.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="Unity.Collections">
+      <HintPath>$(ManagedDLLPath)\Unity.Collections.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="Unity.Mathematics">
+      <HintPath>$(ManagedDLLPath)\Unity.Mathematics.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="Unity.Burst">
+      <HintPath>$(ManagedDLLPath)\Unity.Burst.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="UnityEngine">
+      <HintPath>$(ManagedDLLPath)\UnityEngine.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="UnityEngine.CoreModule">
+      <HintPath>$(ManagedDLLPath)\UnityEngine.CoreModule.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="UnityEngine.ScreenCaptureModule">
+      <HintPath>$(ManagedDLLPath)\UnityEngine.ScreenCaptureModule.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="UnityEngine.ImageConversionModule">
+      <HintPath>$(ManagedDLLPath)\UnityEngine.ImageConversionModule.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="Newtonsoft.Json">
+      <HintPath>$(ManagedDLLPath)\Newtonsoft.Json.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+  </ItemGroup>
+
+  <Target Name="ValidateGamePath" BeforeTargets="ResolveReferences">
+    <Error Condition="!Exists('$(ManagedDLLPath)\Game.dll')"
+           Text="Cities: Skylines II not found (looked in '$(GamePath)'). Set the CS2_PATH environment variable to your game install folder, or pass -p:GamePath=&quot;X:\...\Cities Skylines II&quot; to dotnet build." />
+  </Target>
+
+  <Target Name="DeployToLocalMods" AfterTargets="Build" Condition="'$(SkipDeploy)' != 'true'">
+    <MakeDir Directories="$(ModDeployPath)" />
+    <ItemGroup>
+      <DeployFiles Include="$(TargetDir)$(TargetName).dll" />
+      <DeployFiles Include="$(TargetDir)$(TargetName).pdb" Condition="Exists('$(TargetDir)$(TargetName).pdb')" />
+    </ItemGroup>
+    <Copy SourceFiles="@(DeployFiles)" DestinationFolder="$(ModDeployPath)" />
+    <Message Importance="high" Text="CS2MCP deployed to $(ModDeployPath)" />
+  </Target>
+
+</Project>

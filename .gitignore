@@ -1,0 +1,9 @@
+# local environment / user-specific
+.env
+.env.*
+!.env.example
+*.user
+
+# OS
+Thumbs.db
+.DS_Store
