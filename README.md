@@ -4,8 +4,6 @@
 
 Give Claude (or any MCP client) **full control** over a running Cities: Skylines II game: read city data, drive the camera and take screenshots, build roads and buildings, paint zones, manage finances and policies, and control simulation time.
 
-> 44 MCP tools covering five dimensions — observe / build / tune / govern / time — all verified in-game. An AI can use them to pick a site, build an elevated interchange, zone a residential area, then run the simulation and observe the results. It plays the game the way a player does.
-
 ## Architecture
 
 ```
