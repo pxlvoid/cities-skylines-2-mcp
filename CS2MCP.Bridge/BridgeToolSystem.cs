@@ -41,6 +41,7 @@ namespace CS2MCP
             Net,
             Demolish,
             Upgrade,
+            Replace,
             Area,
         }
 
@@ -55,6 +56,7 @@ namespace CS2MCP
         private float3 m_PendingMid;
         private bool m_PendingHasMid;
         private CompositionFlags m_PendingUpgradeFlags;
+        private Entity m_PendingReplacePrefab;
         private float3[] m_PendingAreaNodes;
         private float2 m_PendingElevations;
         private quaternion m_PendingRotation;
@@ -139,6 +141,28 @@ namespace CS2MCP
             return true;
         }
 
+        /// <summary>
+        /// Swaps an existing segment's prefab while keeping its curve, elevation
+        /// and end nodes, which is what the in-game replace tool does. Drawing a
+        /// new segment over an old one instead trips the overlap check.
+        /// Must be called on the simulation thread.
+        /// </summary>
+        public bool TryQueueReplace(Entity target, Entity newPrefabEntity, PrefabBase newPrefab, string label, BridgeRequest request)
+        {
+            if (m_Stage != Stage.Idle)
+            {
+                return false;
+            }
+            m_PendingKind = OperationKind.Replace;
+            m_PendingTarget = target;
+            m_PendingReplacePrefab = newPrefabEntity;
+            m_PendingPrefab = newPrefab;
+            m_PendingLabel = label;
+            m_PendingRequest = request;
+            Activate();
+            return true;
+        }
+
         /// <summary>Must be called on the simulation thread.</summary>
         public bool TryQueueDemolish(Entity target, string label, BridgeRequest request)
         {
@@ -199,6 +223,9 @@ namespace CS2MCP
                                 break;
                             case OperationKind.Upgrade:
                                 CreateModifyDefinitions(CreationFlags.Upgrade, m_PendingUpgradeFlags);
+                                break;
+                            case OperationKind.Replace:
+                                CreateModifyDefinitions(default, default);
                                 break;
                             case OperationKind.Area:
                                 CreateAreaDefinitions();
@@ -262,6 +289,16 @@ namespace CS2MCP
                         prefab = m_PendingLabel,
                         entity = new { index = m_PendingTarget.Index, version = m_PendingTarget.Version },
                         note = "upgrade applied via the tool pipeline; the segment is recreated with the new composition",
+                    });
+                case OperationKind.Replace:
+                    return BridgeResponse.Json(new
+                    {
+                        replaced = true,
+                        from = m_PendingLabel,
+                        to = m_PendingPrefab != null ? m_PendingPrefab.name : null,
+                        entity = new { index = m_PendingTarget.Index, version = m_PendingTarget.Version },
+                        note = "prefab swapped in place; curve, elevation and end nodes preserved. "
+                            + "The segment gets a new entity id, so re-list before further edits.",
                     });
                 case OperationKind.Net:
                     return BridgeResponse.Json(new
@@ -334,6 +371,12 @@ namespace CS2MCP
                 m_Original = target,
                 m_Flags = flags,
             };
+            if (m_PendingKind == OperationKind.Replace)
+            {
+                // m_Original + a different m_Prefab is the game's own replace path:
+                // the curve and both end nodes are reused, only the prefab changes.
+                definition.m_Prefab = m_PendingReplacePrefab;
+            }
             commandBuffer.AddComponent(e, default(Updated));
             if (upgrades != default(CompositionFlags))
             {
