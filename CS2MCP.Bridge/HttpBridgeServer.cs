@@ -230,8 +230,20 @@ namespace CS2MCP
                 int equals = pair.IndexOf('=');
                 string key = equals < 0 ? pair : pair.Substring(0, equals);
                 string value = equals < 0 ? "" : pair.Substring(equals + 1);
-                request.Query[Uri.UnescapeDataString(key)] = Uri.UnescapeDataString(value);
+                request.Query[DecodeQueryComponent(key)] = DecodeQueryComponent(value);
             }
+        }
+
+        // Query strings are application/x-www-form-urlencoded: '+' means space there.
+        // Uri.UnescapeDataString does not handle that, so swap '+' first; a literal
+        // plus arrives as %2B and is restored by the unescape afterwards.
+        private static string DecodeQueryComponent(string text)
+        {
+            if (text.Length == 0)
+            {
+                return text;
+            }
+            return Uri.UnescapeDataString(text.Replace('+', ' '));
         }
 
         private static void WriteResponse(NetworkStream stream, BridgeResponse response)
