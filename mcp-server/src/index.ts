@@ -521,21 +521,29 @@ server.registerTool(
 server.registerTool(
   "cs2_upgrade_road",
   {
-    title: "Upgrade a road segment",
+    title: "Upgrade or replace a road segment",
     description:
-      "Apply upgrades to an existing road segment (from cs2_list_roads): grass, trees, wideSidewalk, " +
-      "soundBarrier, parking, lighting, medianGrass, medianTrees. Combine multiple with commas. " +
-      "The segment is recreated with the new composition via the game's tool pipeline.",
+      "Change an existing road segment (from cs2_list_roads), in place. Pass 'prefab' to swap the road " +
+      "TYPE (e.g. Small Road -> Medium Road Oneway): the curve, elevation and both end nodes are kept, " +
+      "which drawing a new road over the old one cannot do. Or pass 'upgrades' for add-ons: grass, trees, " +
+      "wideSidewalk, soundBarrier, parking, lighting, medianGrass, medianTrees, combined with commas. " +
+      "One or the other, not both — replace the type first, then upgrade the new segment. " +
+      "A replaced segment gets a new entity id, so re-list before editing it again.",
     inputSchema: {
       index: z.number().int().describe("Road segment entity index"),
       version: z.number().int().describe("Road segment entity version"),
-      upgrades: z.string().describe("Comma-separated upgrade names, e.g. 'grass,lighting'"),
+      prefab: z.string().optional().describe("New road type, exact name from cs2_find_prefabs (replaces the segment in place)"),
+      upgrades: z.string().optional().describe("Comma-separated upgrade names, e.g. 'grass,lighting'"),
       side: z.enum(["both", "left", "right"]).optional().describe("Which side for side upgrades (default both)"),
+      force: z.boolean().optional().describe("Replace even if the new prefab is milestone-locked"),
     },
   },
-  async ({ index, version, upgrades, side }) => {
-    const params = new URLSearchParams({ index: String(index), version: String(version), upgrades });
+  async ({ index, version, prefab, upgrades, side, force }) => {
+    const params = new URLSearchParams({ index: String(index), version: String(version) });
+    if (prefab) params.set("prefab", prefab);
+    if (upgrades) params.set("upgrades", upgrades);
     if (side) params.set("side", side);
+    if (force) params.set("force", "true");
     try {
       return jsonResult(await bridgeJson(`/build/upgrade?${params.toString()}`, 15_000));
     } catch (err) {
@@ -549,23 +557,31 @@ server.registerTool(
   {
     title: "List road segments",
     description:
-      "List road segments (edges) with entity id, prefab name, start/end coordinates and length. " +
-      "Filter spatially with x/z/radius or by prefab-name substring. Use the entity id with cs2_demolish.",
+      "List road segments (edges) with entity id, prefab name, start/end coordinates, node elevation, " +
+      "curve midpoint, length and traffic. Elevation feeds e1/e2 and mid feeds cx/cz of cs2_build_road, " +
+      "so an existing segment can be reproduced exactly. traffic gives volume (accumulated vehicle-time), " +
+      "averageSpeed, speedLimit and congestion (0-1). Pass sort='traffic' to rank jams worst-first — " +
+      "that is the way to find where a city is congested. Filter spatially with x/z/radius or by " +
+      "prefab-name substring; page with offset. Use the entity id with cs2_demolish or cs2_upgrade_road.",
     inputSchema: {
       query: z.string().optional().describe("Prefab-name substring filter"),
       x: z.number().optional().describe("Center X for spatial filter"),
       z: z.number().optional().describe("Center Z for spatial filter"),
       radius: z.number().optional().describe("Radius in meters for spatial filter (default 250)"),
+      sort: z.enum(["traffic"]).optional().describe("'traffic' ranks by congestion x volume, worst first"),
       limit: z.number().int().min(1).max(500).optional().describe("Max results (default 100)"),
+      offset: z.number().int().min(0).optional().describe("Skip this many matches (use nextOffset from the previous page)"),
     },
   },
-  async ({ query, x, z: zCoord, radius, limit }) => {
+  async ({ query, x, z: zCoord, radius, sort, limit, offset }) => {
     const params = new URLSearchParams();
     if (query) params.set("query", query);
     if (x !== undefined) params.set("x", String(x));
     if (zCoord !== undefined) params.set("z", String(zCoord));
     if (radius !== undefined) params.set("radius", String(radius));
+    if (sort) params.set("sort", sort);
     if (limit) params.set("limit", String(limit));
+    if (offset !== undefined) params.set("offset", String(offset));
     try {
       return jsonResult(await bridgeJson(`/city/roads?${params.toString()}`));
     } catch (err) {

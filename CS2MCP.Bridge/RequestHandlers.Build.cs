@@ -1,5 +1,6 @@
 ﻿using System;
 using System.Collections.Generic;
+using Colossal.Mathematics;
 using Game.Prefabs;
 using Game.Simulation;
 using Unity.Collections;
@@ -150,13 +151,17 @@ namespace CS2MCP
 
             request.Query.TryGetValue("query", out string search);
             int limit = request.TryGetInt("limit", out int rawLimit) ? math.clamp(rawLimit, 1, 500) : 100;
+            int offset = request.TryGetInt("offset", out int rawOffset) ? math.max(rawOffset, 0) : 0;
+            bool sortByTraffic = request.Query.TryGetValue("sort", out string sortMode)
+                && string.Equals(sortMode, "traffic", StringComparison.OrdinalIgnoreCase);
             bool hasCenter = request.TryGetFloat("x", out float x) & request.TryGetFloat("z", out float z);
             float radius = request.TryGetFloat("radius", out float rawRadius) ? math.max(rawRadius, 1f) : 250f;
             float2 center = new float2(x, z);
 
             PrefabSystem prefabSystem = World.GetOrCreateSystemManaged<PrefabSystem>();
-            var results = new List<object>();
-            int total = 0;
+            TerrainSystem terrain = World.GetOrCreateSystemManaged<TerrainSystem>();
+            TerrainHeightData heightData = terrain.GetHeightData();
+            var matches = new List<RoadRecord>();
             using (NativeArray<Entity> entities = PlacedRoadQuery.ToEntityArray(Allocator.Temp))
             {
                 foreach (Entity entity in entities)
@@ -175,28 +180,126 @@ namespace CS2MCP
                     {
                         continue;
                     }
-                    total++;
-                    if (results.Count < limit)
+
+                    var record = new RoadRecord
                     {
-                        results.Add(new
-                        {
-                            entity = new { index = entity.Index, version = entity.Version },
-                            prefab = name,
-                            start = new { x = curve.m_Bezier.a.x, z = curve.m_Bezier.a.z },
-                            end = new { x = curve.m_Bezier.d.x, z = curve.m_Bezier.d.z },
-                            length = curve.m_Length,
-                        });
-                    }
+                        Entity = entity,
+                        Prefab = name,
+                        Curve = curve.m_Bezier,
+                        Length = curve.m_Length,
+                        StartElevation = curve.m_Bezier.a.y - TerrainUtils.SampleHeight(ref heightData, curve.m_Bezier.a),
+                        EndElevation = curve.m_Bezier.d.y - TerrainUtils.SampleHeight(ref heightData, curve.m_Bezier.d),
+                        SpeedLimit = -1f,
+                    };
+                    ReadTraffic(entity, prefabRef.m_Prefab, record);
+                    matches.Add(record);
                 }
+            }
+
+            if (sortByTraffic)
+            {
+                // Worst first: a segment is only a problem when it is both slow and busy.
+                matches.Sort((a, b) => (b.Congestion * b.Volume).CompareTo(a.Congestion * a.Volume));
+            }
+
+            var results = new List<object>();
+            for (int i = offset; i < matches.Count && results.Count < limit; i++)
+            {
+                RoadRecord r = matches[i];
+                results.Add(new
+                {
+                    entity = new { index = r.Entity.Index, version = r.Entity.Version },
+                    prefab = r.Prefab,
+                    start = new
+                    {
+                        x = r.Curve.a.x,
+                        z = r.Curve.a.z,
+                        y = r.Curve.a.y,
+                        elevation = r.StartElevation,
+                    },
+                    end = new
+                    {
+                        x = r.Curve.d.x,
+                        z = r.Curve.d.z,
+                        y = r.Curve.d.y,
+                        elevation = r.EndElevation,
+                    },
+                    // Point on the curve at t=0.5: feed back as cx/cz to /build/road
+                    // to reproduce the bend instead of a straight chord.
+                    mid = new
+                    {
+                        x = MathUtils.Position(r.Curve, 0.5f).x,
+                        z = MathUtils.Position(r.Curve, 0.5f).z,
+                    },
+                    length = r.Length,
+                    traffic = r.HasTraffic
+                        ? new
+                        {
+                            volume = r.Volume,
+                            averageSpeed = r.AverageSpeed,
+                            speedLimit = r.SpeedLimit,
+                            congestion = r.Congestion,
+                        }
+                        : null,
+                });
             }
 
             return BridgeResponse.Json(new
             {
-                totalMatches = total,
+                totalMatches = matches.Count,
                 returned = results.Count,
-                note = "one entry per road segment (edge); use entity index+version with /build/demolish",
+                offset,
+                nextOffset = offset + results.Count < matches.Count ? (int?)(offset + results.Count) : null,
+                note = "one entry per road segment (edge); use entity index+version with /build/demolish "
+                    + "or /build/upgrade; elevation feeds e1/e2 and mid feeds cx/cz of /build/road. "
+                    + "traffic.volume is accumulated vehicle-time on the edge, congestion is "
+                    + "1 - averageSpeed/speedLimit; pass sort=traffic to rank jams worst-first.",
                 roads = results,
             });
+        }
+
+        private sealed class RoadRecord
+        {
+            public Entity Entity;
+            public string Prefab;
+            public Bezier4x3 Curve;
+            public float Length;
+            public float StartElevation;
+            public float EndElevation;
+            public bool HasTraffic;
+            public float Volume;
+            public float AverageSpeed;
+            public float SpeedLimit;
+            public float Congestion;
+        }
+
+        /// <summary>
+        /// Game.Net.Road carries the same accumulated flow the traffic infoview
+        /// colours edges with: duration is vehicle-time, distance is vehicle-metres,
+        /// split over two direction sets of four time buckets each.
+        /// </summary>
+        private void ReadTraffic(Entity entity, Entity prefabEntity, RoadRecord record)
+        {
+            if (!EntityManager.HasComponent<Game.Net.Road>(entity))
+            {
+                return;
+            }
+            Game.Net.Road road = EntityManager.GetComponentData<Game.Net.Road>(entity);
+            float duration = math.csum(road.m_TrafficFlowDuration0) + math.csum(road.m_TrafficFlowDuration1);
+            float distance = math.csum(road.m_TrafficFlowDistance0) + math.csum(road.m_TrafficFlowDistance1);
+
+            record.HasTraffic = true;
+            record.Volume = duration;
+            record.AverageSpeed = duration > 0.0001f ? distance / duration : 0f;
+
+            if (EntityManager.HasComponent<RoadData>(prefabEntity))
+            {
+                record.SpeedLimit = EntityManager.GetComponentData<RoadData>(prefabEntity).m_SpeedLimit;
+            }
+            // No traffic yet means no evidence of a jam, not a free-flowing road.
+            record.Congestion = record.SpeedLimit > 0.0001f && duration > 0.0001f
+                ? math.saturate(1f - (record.AverageSpeed / record.SpeedLimit))
+                : 0f;
         }
 
         private BridgeResponse GetPrefabs(BridgeRequest request)
@@ -407,16 +510,51 @@ namespace CS2MCP
             {
                 return BridgeResponse.Error(400, "provide ?index=&version= of a road segment from /city/roads");
             }
-            if (!request.Query.TryGetValue("upgrades", out string upgradesRaw) || string.IsNullOrEmpty(upgradesRaw))
+            request.Query.TryGetValue("upgrades", out string upgradesRaw);
+            bool hasReplacement = request.Query.TryGetValue("prefab", out string replacementName)
+                && !string.IsNullOrEmpty(replacementName);
+            if (string.IsNullOrEmpty(upgradesRaw) && !hasReplacement)
             {
                 return BridgeResponse.Error(400,
-                    $"provide ?upgrades=<comma list>: {string.Join(", ", kUpgradeNames.Keys)}");
+                    $"provide ?prefab=<road name> to change the road type, and/or ?upgrades=<comma list>: {string.Join(", ", kUpgradeNames.Keys)}");
             }
 
             var entity = new Entity { Index = index, Version = version };
             if (!EntityManager.Exists(entity) || !EntityManager.HasComponent<Game.Net.Edge>(entity))
             {
                 return BridgeResponse.Error(404, $"entity {index}:{version} is not an existing road segment");
+            }
+
+            if (hasReplacement)
+            {
+                if (!string.IsNullOrEmpty(upgradesRaw))
+                {
+                    return BridgeResponse.Error(400,
+                        "prefab and upgrades cannot be combined in one call; replace the road type first, then apply upgrades to the new segment");
+                }
+                if (!TryFindPrefabByName(NetPrefabQuery, replacementName, out Entity replacementEntity, out PrefabBase replacementPrefab))
+                {
+                    return BridgeResponse.Error(404, $"unknown network prefab '{replacementName}'; search via /prefabs?category=road|net&query=...");
+                }
+                if (IsLocked(replacementEntity) && !IsForced(request))
+                {
+                    return BridgeResponse.Error(409, $"prefab '{replacementPrefab.name}' is locked (milestone not reached); pass force=true to build anyway");
+                }
+
+                PrefabSystem prefabs = World.GetOrCreateSystemManaged<PrefabSystem>();
+                string currentName = null;
+                if (EntityManager.HasComponent<PrefabRef>(entity))
+                {
+                    PrefabBase current = prefabs.GetPrefab<PrefabBase>(EntityManager.GetComponentData<PrefabRef>(entity).m_Prefab);
+                    currentName = current != null ? current.name : null;
+                }
+
+                BridgeToolSystem replaceTool = World.GetOrCreateSystemManaged<BridgeToolSystem>();
+                if (!replaceTool.TryQueueReplace(entity, replacementEntity, replacementPrefab, currentName, request))
+                {
+                    return BridgeResponse.Error(409, "another build operation is in progress, retry shortly");
+                }
+                return null;
             }
 
             string side = request.Query.TryGetValue("side", out string rawSide) ? rawSide.ToLowerInvariant() : "both";
