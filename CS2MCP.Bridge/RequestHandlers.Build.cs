@@ -161,6 +161,40 @@ namespace CS2MCP
             PrefabSystem prefabSystem = World.GetOrCreateSystemManaged<PrefabSystem>();
             TerrainSystem terrain = World.GetOrCreateSystemManaged<TerrainSystem>();
             TerrainHeightData heightData = terrain.GetHeightData();
+            List<RoadRecord> matches = CollectRoads(search, hasCenter, center, radius);
+
+            if (sortByTraffic)
+            {
+                matches.Sort((a, b) => b.JamScore.CompareTo(a.JamScore));
+            }
+
+            var results = new List<object>();
+            for (int i = offset; i < matches.Count && results.Count < limit; i++)
+            {
+                RoadRecord r = matches[i];
+                results.Add(DescribeRoad(r));
+            }
+
+            return BridgeResponse.Json(new
+            {
+                totalMatches = matches.Count,
+                returned = results.Count,
+                offset,
+                nextOffset = offset + results.Count < matches.Count ? (int?)(offset + results.Count) : null,
+                note = "one entry per road segment (edge); use entity index+version with /build/demolish "
+                    + "or /build/upgrade; elevation feeds e1/e2 and mid feeds cx/cz of /build/road. "
+                    + "traffic.volume is accumulated vehicle-time on the edge, congestion is "
+                    + "1 - averageSpeed/speedLimit, bottleneck is the game's own jam marker; "
+                    + "pass sort=traffic to rank jams worst-first or see /city/traffic for a summary.",
+                roads = results,
+            });
+        }
+
+        private List<RoadRecord> CollectRoads(string search, bool hasCenter, float2 center, float radius)
+        {
+            PrefabSystem prefabSystem = World.GetOrCreateSystemManaged<PrefabSystem>();
+            TerrainSystem terrain = World.GetOrCreateSystemManaged<TerrainSystem>();
+            TerrainHeightData heightData = terrain.GetHeightData();
             var matches = new List<RoadRecord>();
             using (NativeArray<Entity> entities = PlacedRoadQuery.ToEntityArray(Allocator.Temp))
             {
@@ -192,21 +226,23 @@ namespace CS2MCP
                         SpeedLimit = -1f,
                     };
                     ReadTraffic(entity, prefabRef.m_Prefab, record);
+                    ReadBottleneck(entity, record);
+                    ReadOutsideConnection(entity, record);
+                    if (EntityManager.HasComponent<Game.Net.Density>(entity))
+                    {
+                        record.HasDensity = true;
+                        record.Density = EntityManager.GetComponentData<Game.Net.Density>(entity).m_Density;
+                    }
                     matches.Add(record);
                 }
             }
 
-            if (sortByTraffic)
-            {
-                // Worst first: a segment is only a problem when it is both slow and busy.
-                matches.Sort((a, b) => (b.Congestion * b.Volume).CompareTo(a.Congestion * a.Volume));
-            }
+            return matches;
+        }
 
-            var results = new List<object>();
-            for (int i = offset; i < matches.Count && results.Count < limit; i++)
-            {
-                RoadRecord r = matches[i];
-                results.Add(new
+        private object DescribeRoad(RoadRecord r)
+        {
+            return new
                 {
                     entity = new { index = r.Entity.Index, version = r.Entity.Version },
                     prefab = r.Prefab,
@@ -239,22 +275,91 @@ namespace CS2MCP
                             averageSpeed = r.AverageSpeed,
                             speedLimit = r.SpeedLimit,
                             congestion = r.Congestion,
+                            density = r.HasDensity ? (float?)r.Density : null,
+                            jamScore = r.JamScore,
                         }
                         : null,
-                });
+                    // The game's own jam marker, not a derived guess.
+                    bottleneck = r.HasBottleneck
+                        ? new
+                        {
+                            position = r.BottleneckPosition,
+                            from = r.BottleneckFrom,
+                            to = r.BottleneckTo,
+                            timer = r.BottleneckTimer,
+                        }
+                        : null,
+                    outsideConnection = r.IsOutsideConnection
+                        ? new { delay = r.OutsideDelay }
+                        : null,
+                };
+        }
+
+        /// <summary>
+        /// City-wide traffic summary: where the jams are, without having to page
+        /// through every segment first.
+        /// </summary>
+        private BridgeResponse TrafficReport(BridgeRequest request)
+        {
+            if (!TryGetCity(out _, out BridgeResponse error))
+            {
+                return error;
+            }
+
+            request.Query.TryGetValue("query", out string search);
+            int limit = request.TryGetInt("limit", out int rawLimit) ? math.clamp(rawLimit, 1, 100) : 15;
+            bool hasCenter = request.TryGetFloat("x", out float x) & request.TryGetFloat("z", out float z);
+            float radius = request.TryGetFloat("radius", out float rawRadius) ? math.max(rawRadius, 1f) : 250f;
+
+            List<RoadRecord> roads = CollectRoads(search, hasCenter, new float2(x, z), radius);
+
+            float totalVolume = 0f;
+            float weightedCongestion = 0f;
+            int bottlenecks = 0;
+            var outsideConnections = new List<object>();
+            foreach (RoadRecord r in roads)
+            {
+                totalVolume += r.Volume;
+                weightedCongestion += r.Congestion * r.Volume;
+                if (r.HasBottleneck)
+                {
+                    bottlenecks++;
+                }
+                if (r.IsOutsideConnection)
+                {
+                    outsideConnections.Add(new
+                    {
+                        entity = new { index = r.Entity.Index, version = r.Entity.Version },
+                        prefab = r.Prefab,
+                        at = new { x = r.Curve.a.x, z = r.Curve.a.z },
+                        delay = r.OutsideDelay,
+                        congestion = r.Congestion,
+                    });
+                }
+            }
+
+            roads.Sort((a, b) => b.JamScore.CompareTo(a.JamScore));
+            var worst = new List<object>();
+            for (int i = 0; i < roads.Count && worst.Count < limit; i++)
+            {
+                if (roads[i].JamScore <= 0f)
+                {
+                    break;
+                }
+                worst.Add(DescribeRoad(roads[i]));
             }
 
             return BridgeResponse.Json(new
             {
-                totalMatches = matches.Count,
-                returned = results.Count,
-                offset,
-                nextOffset = offset + results.Count < matches.Count ? (int?)(offset + results.Count) : null,
-                note = "one entry per road segment (edge); use entity index+version with /build/demolish "
-                    + "or /build/upgrade; elevation feeds e1/e2 and mid feeds cx/cz of /build/road. "
-                    + "traffic.volume is accumulated vehicle-time on the edge, congestion is "
-                    + "1 - averageSpeed/speedLimit; pass sort=traffic to rank jams worst-first.",
-                roads = results,
+                segments = roads.Count,
+                // Volume-weighted, so empty back streets cannot dilute the number.
+                averageCongestion = totalVolume > 0.0001f ? weightedCongestion / totalVolume : 0f,
+                bottlenecks,
+                outsideConnections,
+                worstSegments = worst,
+                note = "worstSegments is ranked by congestion x volume plus the game's own bottleneck "
+                    + "timer; bottleneck.from/to locate the jam along the segment as 0-1 fractions. "
+                    + "Filter with x/z/radius or query to report on one area.",
             });
         }
 
@@ -271,6 +376,88 @@ namespace CS2MCP
             public float AverageSpeed;
             public float SpeedLimit;
             public float Congestion;
+            public bool HasDensity;
+            public float Density;
+            public bool HasBottleneck;
+            public float BottleneckPosition;
+            public float BottleneckFrom;
+            public float BottleneckTo;
+            public int BottleneckTimer;
+            public bool IsOutsideConnection;
+            public float OutsideDelay;
+
+            /// <summary>Ranking score: a slow empty road is not a jam, nor is a busy fast one.</summary>
+            public float JamScore => (Congestion * Volume) + (HasBottleneck ? BottleneckTimer : 0f);
+        }
+
+        /// <summary>
+        /// Game.Net.Bottleneck is what TrafficBottleneckSystem writes when vehicles
+        /// pile up; it lives on the lanes, so the edge's sub-lanes are checked too.
+        /// Positions are bytes over the lane, reported here as 0-1 fractions.
+        /// </summary>
+        private void ReadBottleneck(Entity entity, RoadRecord record)
+        {
+            if (TryReadBottleneck(entity, record))
+            {
+                return;
+            }
+            if (!EntityManager.HasBuffer<Game.Net.SubLane>(entity))
+            {
+                return;
+            }
+            DynamicBuffer<Game.Net.SubLane> lanes = EntityManager.GetBuffer<Game.Net.SubLane>(entity, isReadOnly: true);
+            for (int i = 0; i < lanes.Length; i++)
+            {
+                // Keep the longest-standing one: that is the lane actually holding the jam.
+                TryReadBottleneck(lanes[i].m_SubLane, record);
+            }
+        }
+
+        private bool TryReadBottleneck(Entity candidate, RoadRecord record)
+        {
+            if (candidate == Entity.Null
+                || !EntityManager.Exists(candidate)
+                || !EntityManager.HasComponent<Game.Net.Bottleneck>(candidate))
+            {
+                return false;
+            }
+            Game.Net.Bottleneck bottleneck = EntityManager.GetComponentData<Game.Net.Bottleneck>(candidate);
+            if (record.HasBottleneck && bottleneck.m_Timer <= record.BottleneckTimer)
+            {
+                return true;
+            }
+            record.HasBottleneck = true;
+            record.BottleneckPosition = bottleneck.m_Position / 255f;
+            record.BottleneckFrom = bottleneck.m_MinPos / 255f;
+            record.BottleneckTo = bottleneck.m_MaxPos / 255f;
+            record.BottleneckTimer = bottleneck.m_Timer;
+            return true;
+        }
+
+        /// <summary>
+        /// Outside connections live on the end nodes, and their delay is how long
+        /// traffic queues to leave or enter the map there.
+        /// </summary>
+        private void ReadOutsideConnection(Entity entity, RoadRecord record)
+        {
+            if (!EntityManager.HasComponent<Game.Net.Edge>(entity))
+            {
+                return;
+            }
+            Game.Net.Edge edge = EntityManager.GetComponentData<Game.Net.Edge>(entity);
+            foreach (Entity node in new[] { edge.m_Start, edge.m_End })
+            {
+                if (node == Entity.Null
+                    || !EntityManager.Exists(node)
+                    || !EntityManager.HasComponent<Game.Net.OutsideConnection>(node))
+                {
+                    continue;
+                }
+                record.IsOutsideConnection = true;
+                record.OutsideDelay = math.max(
+                    record.OutsideDelay,
+                    EntityManager.GetComponentData<Game.Net.OutsideConnection>(node).m_Delay);
+            }
         }
 
         /// <summary>
@@ -633,6 +820,9 @@ namespace CS2MCP
                                 y = transform.m_Position.y,
                                 z = transform.m_Position.z,
                             },
+                            status = ReadBuildingStatus(entity),
+                            efficiency = ReadEfficiency(entity),
+                            workers = ReadWorkers(entity),
                         });
                     }
                 }
@@ -642,9 +832,96 @@ namespace CS2MCP
             {
                 totalMatches = total,
                 returned = results.Count,
-                note = "use entity index+version with /build/demolish",
+                note = "use entity index+version with /build/demolish; efficiency.factors names "
+                    + "what is holding a building back (NotEnoughEmployees, ElectricitySupply, "
+                    + "MaterialSupply...), workers shows staffing of the company renting it",
                 buildings = results,
             });
+        }
+
+        private object ReadBuildingStatus(Entity entity)
+        {
+            bool abandoned = EntityManager.HasComponent<Game.Buildings.Abandoned>(entity);
+            bool condemned = EntityManager.HasComponent<Game.Buildings.Condemned>(entity);
+            float? condition = EntityManager.HasComponent<Game.Buildings.BuildingCondition>(entity)
+                ? EntityManager.GetComponentData<Game.Buildings.BuildingCondition>(entity).m_Condition
+                : (float?)null;
+            if (!abandoned && !condemned && condition == null)
+            {
+                return null;
+            }
+            return new { abandoned, condemned, condition };
+        }
+
+        /// <summary>
+        /// The Efficiency buffer is one entry per limiting factor, each a multiplier.
+        /// Their product is the building's actual efficiency, and the entries below 1
+        /// are the answer to "why is this building underperforming".
+        /// </summary>
+        private object ReadEfficiency(Entity entity)
+        {
+            if (!EntityManager.HasBuffer<Game.Buildings.Efficiency>(entity))
+            {
+                return null;
+            }
+            DynamicBuffer<Game.Buildings.Efficiency> buffer =
+                EntityManager.GetBuffer<Game.Buildings.Efficiency>(entity, isReadOnly: true);
+            float overall = 1f;
+            var factors = new List<object>();
+            for (int i = 0; i < buffer.Length; i++)
+            {
+                Game.Buildings.Efficiency item = buffer[i];
+                overall *= item.m_Efficiency;
+                if (item.m_Efficiency < 0.999f)
+                {
+                    factors.Add(new
+                    {
+                        factor = item.m_Factor.ToString(),
+                        efficiency = item.m_Efficiency,
+                    });
+                }
+            }
+            return new { value = overall, factors };
+        }
+
+        /// <summary>
+        /// Workplaces belong to the company renting the building, not the building,
+        /// so the Renter buffer has to be walked to reach WorkProvider.
+        /// </summary>
+        private object ReadWorkers(Entity entity)
+        {
+            if (!EntityManager.HasBuffer<Game.Buildings.Renter>(entity))
+            {
+                return null;
+            }
+            DynamicBuffer<Game.Buildings.Renter> renters =
+                EntityManager.GetBuffer<Game.Buildings.Renter>(entity, isReadOnly: true);
+            for (int i = 0; i < renters.Length; i++)
+            {
+                Entity company = renters[i].m_Renter;
+                if (company == Entity.Null
+                    || !EntityManager.Exists(company)
+                    || !EntityManager.HasComponent<Game.Companies.WorkProvider>(company))
+                {
+                    continue;
+                }
+                Game.Companies.WorkProvider provider =
+                    EntityManager.GetComponentData<Game.Companies.WorkProvider>(company);
+                int employees = EntityManager.HasBuffer<Game.Companies.Employee>(company)
+                    ? EntityManager.GetBuffer<Game.Companies.Employee>(company, isReadOnly: true).Length
+                    : 0;
+                int? profitability = EntityManager.HasComponent<Game.Companies.Profitability>(company)
+                    ? EntityManager.GetComponentData<Game.Companies.Profitability>(company).m_Profitability
+                    : (int?)null;
+                return new
+                {
+                    employees,
+                    maxWorkers = provider.m_MaxWorkers,
+                    shortage = math.max(0, provider.m_MaxWorkers - employees),
+                    profitability,
+                };
+            }
+            return null;
         }
 
         private BridgeResponse Demolish(BridgeRequest request)

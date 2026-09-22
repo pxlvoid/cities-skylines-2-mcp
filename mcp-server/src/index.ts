@@ -459,12 +459,49 @@ server.registerTool(
 );
 
 server.registerTool(
+  "cs2_traffic_report",
+  {
+    title: "Traffic and congestion report",
+    description:
+      "Find where a city is congested. Returns the volume-weighted average congestion, how many " +
+      "segments the game currently flags as bottlenecks, every outside (map edge) connection with its " +
+      "queueing delay, and the worst segments ranked by congestion x volume plus bottleneck duration. " +
+      "Each worst segment carries its coordinates and entity id, ready for cs2_upgrade_road. " +
+      "Start here when asked about traffic jams, then narrow down with x/z/radius.",
+    inputSchema: {
+      query: z.string().optional().describe("Prefab-name substring filter, e.g. 'Highway'"),
+      x: z.number().optional().describe("Center X to report on one area"),
+      z: z.number().optional().describe("Center Z to report on one area"),
+      radius: z.number().optional().describe("Radius in meters (default 250, only with x/z)"),
+      limit: z.number().int().min(1).max(100).optional().describe("How many worst segments (default 15)"),
+    },
+  },
+  async ({ query, x, z: zCoord, radius, limit }) => {
+    const params = new URLSearchParams();
+    if (query) params.set("query", query);
+    if (x !== undefined) params.set("x", String(x));
+    if (zCoord !== undefined) params.set("z", String(zCoord));
+    if (radius !== undefined) params.set("radius", String(radius));
+    if (limit) params.set("limit", String(limit));
+    try {
+      return jsonResult(await bridgeJson(`/city/traffic?${params.toString()}`));
+    } catch (err) {
+      return errorResult(err);
+    }
+  },
+);
+
+server.registerTool(
   "cs2_list_buildings",
   {
     title: "List placed buildings",
     description:
       "List buildings existing in the city with their prefab name, world position and entity id " +
-      "(index+version, needed for cs2_demolish). Filter by name substring to find specific buildings.",
+      "(index+version, needed for cs2_demolish). Filter by name substring to find specific buildings. " +
+      "Each building also reports efficiency with the factors holding it back (NotEnoughEmployees, " +
+      "ElectricitySupply, MaterialSupply, Garbage...), which is how to tell WHY a building " +
+      "underperforms, plus workers (employees vs maxWorkers, shortage, profitability) of the company " +
+      "renting it, and status for abandoned/condemned buildings.",
     inputSchema: {
       query: z.string().optional().describe("Case-insensitive prefab-name substring filter"),
       limit: z.number().int().min(1).max(500).optional().describe("Max results (default 100)"),
