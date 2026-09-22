@@ -35,6 +35,21 @@ namespace CS2MCP
 
         private IEnumerator CaptureRoutine(BridgeRequest request)
         {
+            // While a tool is active the game draws networks as white outlines,
+            // so a screenshot taken then shows the tool preview instead of the
+            // city. Drop back to the default tool for the capture and restore it
+            // afterwards. One frame is needed for the renderer to catch up.
+            Game.Tools.ToolSystem toolSystem = null;
+            Game.Tools.ToolBaseSystem suspendedTool = null;
+            if (!request.TryGetBool("keepTool", out bool keepTool) || !keepTool)
+            {
+                toolSystem = TrySuspendActiveTool(out suspendedTool);
+                if (toolSystem != null)
+                {
+                    yield return null;
+                }
+            }
+
             yield return new WaitForEndOfFrame();
 
             Texture2D captured = null;
@@ -80,6 +95,48 @@ namespace CS2MCP
                 {
                     Destroy(captured);
                 }
+                if (toolSystem != null && suspendedTool != null)
+                {
+                    toolSystem.activeTool = suspendedTool;
+                }
+            }
+        }
+
+        /// <summary>
+        /// Switches to the default tool if anything else is active, returning the
+        /// ToolSystem so the caller can put the previous tool back. Returns null
+        /// when nothing had to change, which is the common case.
+        /// </summary>
+        private static Game.Tools.ToolSystem TrySuspendActiveTool(out Game.Tools.ToolBaseSystem previous)
+        {
+            previous = null;
+            try
+            {
+                Unity.Entities.World world = Unity.Entities.World.DefaultGameObjectInjectionWorld;
+                if (world == null)
+                {
+                    return null;
+                }
+                var toolSystem = world.GetExistingSystemManaged<Game.Tools.ToolSystem>();
+                var defaultTool = world.GetExistingSystemManaged<Game.Tools.DefaultToolSystem>();
+                if (toolSystem == null || defaultTool == null)
+                {
+                    return null;
+                }
+                Game.Tools.ToolBaseSystem active = toolSystem.activeTool;
+                if (active == null || ReferenceEquals(active, defaultTool))
+                {
+                    return null;
+                }
+                previous = active;
+                toolSystem.activeTool = defaultTool;
+                return toolSystem;
+            }
+            catch (Exception e)
+            {
+                // A screenshot is never worth failing over a tool swap.
+                Mod.Log.Warn($"screenshot could not suspend the active tool: {e.Message}");
+                return null;
             }
         }
 

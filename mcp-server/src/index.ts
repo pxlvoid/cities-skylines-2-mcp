@@ -423,7 +423,10 @@ server.registerTool(
       "Build any network segment between two world coordinates (terrain-following): roads, train tracks, " +
       "pedestrian paths, power lines, pipes 鈥?any prefab from cs2_find_prefabs category 'road' or 'net'. " +
       "Straight by default; pass cx/cz for a curved segment through that control point. Length 8-1500m. " +
-      "Endpoints on existing nodes connect to them. Costs city money; fails with an explanation if blocked.",
+      "Endpoints on existing nodes connect to them. To join a road part-way along it instead of at a " +
+      "node - a new ramp or side street off the middle of a long segment - pass startEdge/startEdgeVersion " +
+      "or endEdge/endEdgeVersion from cs2_list_roads; the game splits that segment and builds the " +
+      "junction there, matching its height. Costs city money; fails with an explanation if blocked.",
     inputSchema: {
       prefab: z.string().describe("Exact prefab name from cs2_find_prefabs (category road or net)"),
       x1: z.number().describe("Start X (meters)"),
@@ -432,12 +435,19 @@ server.registerTool(
       z2: z.number().describe("End Z (meters)"),
       cx: z.number().optional().describe("Curve control point X (with cz: builds a curve through it)"),
       cz: z.number().optional().describe("Curve control point Z"),
+      startEdge: z.number().int().optional().describe("Entity index of a road to join at the START, part-way along it (from cs2_list_roads)"),
+      startEdgeVersion: z.number().int().optional().describe("Entity version of startEdge"),
+      startSplit: z.number().min(0).max(1).optional().describe("Where along startEdge to join, 0-1 (default: nearest point to x1/z1)"),
+      endEdge: z.number().int().optional().describe("Entity index of a road to join at the END, part-way along it"),
+      endEdgeVersion: z.number().int().optional().describe("Entity version of endEdge"),
+      endSplit: z.number().min(0).max(1).optional().describe("Where along endEdge to join, 0-1 (default: nearest point to x2/z2)"),
       e1: z.number().optional().describe("Elevation at start in meters (bridges/elevated; negative = tunnel-ish)"),
       e2: z.number().optional().describe("Elevation at end in meters"),
       force: z.boolean().optional().describe("Build even if the prefab is milestone-locked"),
     },
   },
-  async ({ prefab, x1, z1, x2, z2, cx, cz, e1, e2, force }) => {
+  async ({ prefab, x1, z1, x2, z2, cx, cz, e1, e2, force,
+           startEdge, startEdgeVersion, startSplit, endEdge, endEdgeVersion, endSplit }) => {
     const params = new URLSearchParams({
       prefab,
       x1: String(x1),
@@ -447,6 +457,12 @@ server.registerTool(
     });
     if (cx !== undefined) params.set("cx", String(cx));
     if (cz !== undefined) params.set("cz", String(cz));
+    if (startEdge !== undefined) params.set("startEdge", String(startEdge));
+    if (startEdgeVersion !== undefined) params.set("startEdgeVersion", String(startEdgeVersion));
+    if (startSplit !== undefined) params.set("startSplit", String(startSplit));
+    if (endEdge !== undefined) params.set("endEdge", String(endEdge));
+    if (endEdgeVersion !== undefined) params.set("endEdgeVersion", String(endEdgeVersion));
+    if (endSplit !== undefined) params.set("endSplit", String(endSplit));
     if (e1 !== undefined) params.set("e1", String(e1));
     if (e2 !== undefined) params.set("e2", String(e2));
     if (force) params.set("force", "true");
@@ -456,6 +472,41 @@ server.registerTool(
       return errorResult(err);
     }
   },
+);
+
+server.registerTool(
+  "cs2_create_transport_line",
+  {
+    title: "Create a transport line",
+    description:
+      "Create a bus, tram, subway, train, ship or air line through existing stops, in travel order. " +
+      "Stops are transport stop/station entities - find them with cs2_list_buildings - given as " +
+      "'index:version' pairs. Get line types from cs2_find_prefabs with category 'route'. " +
+      "The line is created without vehicles; assign those in game. Use cs2_list_transport_lines to verify.",
+    inputSchema: {
+      prefab: z.string().describe("Transport line prefab, exact name from cs2_find_prefabs(category='route')"),
+      stops: z.string().describe("Stops in travel order as 'index:version,index:version,...' (at least 2)"),
+      force: z.boolean().optional().describe("Create even if the line type is milestone-locked"),
+    },
+  },
+  async ({ prefab, stops, force }) => {
+    const params = new URLSearchParams({ prefab, stops });
+    if (force) params.set("force", "true");
+    try {
+      return jsonResult(await bridgeJson(`/build/route?${params.toString()}`, 15_000));
+    } catch (err) {
+      return errorResult(err);
+    }
+  },
+);
+
+registerJsonTool(
+  "cs2_list_transport_lines",
+  "List transport lines",
+  "List the city's transport lines with their type, stop and vehicle counts, vehicle interval, " +
+    "ticket price, whether the game flags them as short of vehicles, and the passengers waiting at " +
+    "their stops with the worst average wait. Use it to tell an overloaded line from an idle one.",
+  "/city/routes",
 );
 
 server.registerTool(

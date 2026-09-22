@@ -43,6 +43,7 @@ namespace CS2MCP
             Upgrade,
             Replace,
             Area,
+            Route,
         }
 
         private Stage m_Stage = Stage.Idle;
@@ -57,7 +58,12 @@ namespace CS2MCP
         private bool m_PendingHasMid;
         private CompositionFlags m_PendingUpgradeFlags;
         private Entity m_PendingReplacePrefab;
+        private Entity m_PendingStartEdge;
+        private Entity m_PendingEndEdge;
+        private float m_PendingStartSplit;
+        private float m_PendingEndSplit;
         private float3[] m_PendingAreaNodes;
+        private Entity[] m_PendingRouteStops;
         private float2 m_PendingElevations;
         private quaternion m_PendingRotation;
         private BridgeRequest m_PendingRequest;
@@ -107,10 +113,27 @@ namespace CS2MCP
         /// <summary>Must be called on the simulation thread.</summary>
         public bool TryQueueRoad(Entity prefabEntity, PrefabBase prefab, float3 start, float3 end, float3 mid, bool hasMid, float2 elevations, BridgeRequest request)
         {
+            return TryQueueRoad(prefabEntity, prefab, start, end, mid, hasMid, elevations,
+                Entity.Null, 0f, Entity.Null, 0f, request);
+        }
+
+        /// <summary>
+        /// Same, but each end may attach part-way along an existing edge instead of
+        /// only at its nodes: pass the edge and the 0-1 position along its curve and
+        /// the game splits it and creates the junction there.
+        /// Must be called on the simulation thread.
+        /// </summary>
+        public bool TryQueueRoad(Entity prefabEntity, PrefabBase prefab, float3 start, float3 end, float3 mid, bool hasMid, float2 elevations,
+            Entity startEdge, float startSplit, Entity endEdge, float endSplit, BridgeRequest request)
+        {
             if (m_Stage != Stage.Idle)
             {
                 return false;
             }
+            m_PendingStartEdge = startEdge;
+            m_PendingStartSplit = startSplit;
+            m_PendingEndEdge = endEdge;
+            m_PendingEndSplit = endSplit;
             m_PendingKind = OperationKind.Net;
             m_PendingPrefabEntity = prefabEntity;
             m_PendingPrefab = prefab;
@@ -194,6 +217,25 @@ namespace CS2MCP
             return true;
         }
 
+        /// <summary>
+        /// Queues a transport line through the given stops, in order.
+        /// Must be called on the simulation thread.
+        /// </summary>
+        public bool TryQueueRoute(Entity prefabEntity, PrefabBase prefab, Entity[] stops, BridgeRequest request)
+        {
+            if (m_Stage != Stage.Idle)
+            {
+                return false;
+            }
+            m_PendingKind = OperationKind.Route;
+            m_PendingPrefabEntity = prefabEntity;
+            m_PendingPrefab = prefab;
+            m_PendingRouteStops = stops;
+            m_PendingRequest = request;
+            Activate();
+            return true;
+        }
+
         private void Activate()
         {
             m_Stage = Stage.CreateDefinitions;
@@ -229,6 +271,9 @@ namespace CS2MCP
                                 break;
                             case OperationKind.Area:
                                 CreateAreaDefinitions();
+                                break;
+                            case OperationKind.Route:
+                                CreateRouteDefinitions();
                                 break;
                         }
                         m_Stage = Stage.Apply;
@@ -308,6 +353,15 @@ namespace CS2MCP
                         start = new { x = m_PendingPosition.x, z = m_PendingPosition.z },
                         end = new { x = m_PendingEnd.x, z = m_PendingEnd.z },
                         note = "committed this frame; verify via /city/roads or /screenshot",
+                    });
+                case OperationKind.Route:
+                    return BridgeResponse.Json(new
+                    {
+                        created = true,
+                        prefab = m_PendingPrefab != null ? m_PendingPrefab.name : null,
+                        stops = m_PendingRouteStops != null ? m_PendingRouteStops.Length : 0,
+                        note = "line committed this frame; it needs vehicles assigned to start running. "
+                            + "List it via /city/routes.",
                     });
                 case OperationKind.Area:
                     return BridgeResponse.Json(new
@@ -463,28 +517,135 @@ namespace CS2MCP
         /// start to end position, terrain-following (mirrors the standalone-net
         /// branch of the game's net definition flow).
         /// </summary>
+        /// <summary>
+        /// Points a course end at an existing edge so the game splits it there.
+        /// A node target needs no split, and FreeHeight is dropped because the
+        /// junction has to sit at the height of the road being joined.
+        /// </summary>
+        private void AttachToEdge(ref CoursePos position, Entity target, float split)
+        {
+            if (target == Entity.Null || !EntityManager.Exists(target))
+            {
+                return;
+            }
+            position.m_Entity = target;
+            // The junction sits at the height of the road being joined, not at
+            // whatever height the new course would pick for itself.
+            position.m_Flags &= ~CoursePosFlags.FreeHeight;
+            if (EntityManager.HasComponent<Edge>(target))
+            {
+                position.m_SplitPosition = math.clamp(split, 0f, 1f);
+            }
+        }
+
+        /// <summary>
+        /// Exact world point where a course end attaches, so the curve is built to
+        /// land on it rather than near it. Returns false when nothing is attached.
+        /// </summary>
+        private bool TryResolveAttachPoint(Entity target, float split, out float3 point)
+        {
+            point = default;
+            if (target == Entity.Null || !EntityManager.Exists(target))
+            {
+                return false;
+            }
+            if (EntityManager.HasComponent<Edge>(target))
+            {
+                Curve curve = EntityManager.GetComponentData<Curve>(target);
+                point = MathUtils.Position(curve.m_Bezier, math.clamp(split, 0f, 1f));
+                return true;
+            }
+            if (EntityManager.HasComponent<Game.Objects.Transform>(target))
+            {
+                point = EntityManager.GetComponentData<Game.Objects.Transform>(target).m_Position;
+                return true;
+            }
+            return false;
+        }
+
+        /// <summary>
+        /// A transport line is a CreationDefinition plus one WaypointDefinition per
+        /// stop, in travel order. m_Connection points at the stop the waypoint
+        /// serves; the game's WaypointConnectionSystem wires up the lanes from it.
+        /// The line closes back to the first stop, as the in-game tool does.
+        /// </summary>
+        private void CreateRouteDefinitions()
+        {
+            Unity.Mathematics.Random random = RandomSeed.Next().GetRandom(0);
+            EntityCommandBuffer commandBuffer = m_ToolOutputBarrier.CreateCommandBuffer();
+            Entity entity = commandBuffer.CreateEntity();
+            commandBuffer.AddComponent(entity, new CreationDefinition
+            {
+                m_Prefab = m_PendingPrefabEntity,
+                m_RandomSeed = random.NextInt(),
+            });
+            commandBuffer.AddComponent(entity, default(Updated));
+
+            DynamicBuffer<Game.Routes.WaypointDefinition> waypoints =
+                commandBuffer.AddBuffer<Game.Routes.WaypointDefinition>(entity);
+            foreach (Entity stop in m_PendingRouteStops)
+            {
+                waypoints.Add(new Game.Routes.WaypointDefinition
+                {
+                    m_Position = GetStopPosition(stop),
+                    m_Connection = stop,
+                });
+            }
+        }
+
+        private float3 GetStopPosition(Entity stop)
+        {
+            if (EntityManager.HasComponent<Game.Routes.Position>(stop))
+            {
+                return EntityManager.GetComponentData<Game.Routes.Position>(stop).m_Position;
+            }
+            if (EntityManager.HasComponent<Transform>(stop))
+            {
+                return EntityManager.GetComponentData<Transform>(stop).m_Position;
+            }
+            return default;
+        }
+
         private void CreateRoadDefinitions()
         {
             TerrainHeightData terrainHeight = m_TerrainSystem.GetHeightData();
+
+            // An attached end is pinned to the exact point on the road being
+            // joined, and then held there: letting the curve re-settle onto the
+            // terrain would pull the junction off an elevated or sunken road.
+            float3 startPoint = m_PendingPosition;
+            float3 endPoint = m_PendingEnd;
+            bool fixedStart = TryResolveAttachPoint(m_PendingStartEdge, m_PendingStartSplit, out float3 startAttach);
+            if (fixedStart)
+            {
+                startPoint = startAttach;
+            }
+            bool fixedEnd = TryResolveAttachPoint(m_PendingEndEdge, m_PendingEndSplit, out float3 endAttach);
+            if (fixedEnd)
+            {
+                endPoint = endAttach;
+            }
 
             Curve rawCurve = default;
             if (m_PendingHasMid)
             {
                 // Quadratic bezier through the mid control point, elevated to cubic.
-                float3 a = m_PendingPosition;
-                float3 d = m_PendingEnd;
+                float3 a = startPoint;
+                float3 d = endPoint;
                 float3 m = m_PendingMid;
                 rawCurve.m_Bezier = new Bezier4x3(a, a + (m - a) * (2f / 3f), d + (m - d) * (2f / 3f), d);
             }
             else
             {
-                rawCurve.m_Bezier = NetUtils.StraightCurve(m_PendingPosition, m_PendingEnd);
+                rawCurve.m_Bezier = NetUtils.StraightCurve(startPoint, endPoint);
             }
             Bezier4x3 adjusted = NetUtils.AdjustPosition(
-                rawCurve, fixedStart: false, linearMiddle: false, fixedEnd: false, ref terrainHeight).m_Bezier;
+                rawCurve, fixedStart, linearMiddle: false, fixedEnd, ref terrainHeight).m_Bezier;
 
-            float e1 = m_PendingElevations.x;
-            float e2 = m_PendingElevations.y;
+            // An attached end already carries the joined road's height, so an
+            // elevation offset there would lift the junction off it.
+            float e1 = fixedStart ? 0f : m_PendingElevations.x;
+            float e2 = fixedEnd ? 0f : m_PendingElevations.y;
             if (e1 != 0f || e2 != 0f)
             {
                 // Lift the terrain-following curve by linearly interpolated
@@ -505,12 +666,14 @@ namespace CS2MCP
             course.m_StartPosition.m_ParentMesh = -1;
             course.m_StartPosition.m_Elevation = e1;
             course.m_StartPosition.m_Flags = CoursePosFlags.IsFirst | CoursePosFlags.FreeHeight;
+            AttachToEdge(ref course.m_StartPosition, m_PendingStartEdge, m_PendingStartSplit);
             course.m_EndPosition.m_Position = course.m_Curve.d;
             course.m_EndPosition.m_Rotation = NetUtils.GetNodeRotation(MathUtils.EndTangent(course.m_Curve));
             course.m_EndPosition.m_CourseDelta = 1f;
             course.m_EndPosition.m_ParentMesh = -1;
             course.m_EndPosition.m_Elevation = e2;
             course.m_EndPosition.m_Flags = CoursePosFlags.IsLast | CoursePosFlags.FreeHeight;
+            AttachToEdge(ref course.m_EndPosition, m_PendingEndEdge, m_PendingEndSplit);
             course.m_Length = MathUtils.Length(course.m_Curve);
             course.m_FixedIndex = -1;
 

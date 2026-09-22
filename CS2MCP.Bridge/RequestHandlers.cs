@@ -97,6 +97,10 @@ namespace CS2MCP
                     return ListRoads(request);
                 case "/city/traffic":
                     return TrafficReport(request);
+                case "/city/routes":
+                    return ListRoutes(request);
+                case "/build/route":
+                    return BuildRoute(request);
                 case "/city/loan":
                     return GetLoan();
                 case "/city/loan/set":

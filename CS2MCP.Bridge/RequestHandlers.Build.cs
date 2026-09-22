@@ -44,6 +44,24 @@ namespace CS2MCP
             }
         }
 
+        private EntityQuery m_RoutePrefabQuery;
+        private bool m_RoutePrefabQueryCreated;
+
+        private EntityQuery RoutePrefabQuery
+        {
+            get
+            {
+                if (!m_RoutePrefabQueryCreated)
+                {
+                    m_RoutePrefabQuery = EntityManager.CreateEntityQuery(
+                        ComponentType.ReadOnly<PrefabData>(),
+                        ComponentType.ReadOnly<TransportLineData>());
+                    m_RoutePrefabQueryCreated = true;
+                }
+                return m_RoutePrefabQuery;
+            }
+        }
+
         private EntityQuery TreePrefabQuery
         {
             get
@@ -514,8 +532,11 @@ namespace CS2MCP
                 case "tree":
                     query = TreePrefabQuery;
                     break;
+                case "route":
+                    query = RoutePrefabQuery;
+                    break;
                 default:
-                    return BridgeResponse.Error(400, "category must be 'building', 'road', 'net' (all networks incl. pipes/power/tracks/paths) or 'tree'");
+                    return BridgeResponse.Error(400, "category must be 'building', 'road', 'net' (all networks incl. pipes/power/tracks/paths), 'tree' or 'route' (transport lines)");
             }
 
             request.Query.TryGetValue("query", out string search);
@@ -666,12 +687,244 @@ namespace CS2MCP
             request.TryGetFloat("e2", out float e2);
             var elevations = new float2(math.clamp(e1, -30f, 60f), math.clamp(e2, -30f, 60f));
 
+            if (!TryResolveAttachment(request, "start", start, out Entity startEdge, out float startSplit, out BridgeResponse startError))
+            {
+                return startError;
+            }
+            if (!TryResolveAttachment(request, "end", end, out Entity endEdge, out float endSplit, out BridgeResponse endError))
+            {
+                return endError;
+            }
+
             BridgeToolSystem tool = World.GetOrCreateSystemManaged<BridgeToolSystem>();
-            if (!tool.TryQueueRoad(prefabEntity, prefab, start, end, mid, hasMid, elevations, request))
+            if (!tool.TryQueueRoad(prefabEntity, prefab, start, end, mid, hasMid, elevations,
+                startEdge, startSplit, endEdge, endSplit, request))
             {
                 return BridgeResponse.Error(409, "another build operation is in progress, retry shortly");
             }
             return null;
+        }
+
+        private BridgeResponse BuildRoute(BridgeRequest request)
+        {
+            if (!TryGetCity(out _, out BridgeResponse error))
+            {
+                return error;
+            }
+            if (!request.Query.TryGetValue("prefab", out string prefabName) || string.IsNullOrEmpty(prefabName))
+            {
+                return BridgeResponse.Error(400, "provide ?prefab=<name from /prefabs?category=route>");
+            }
+            if (!request.Query.TryGetValue("stops", out string stopsRaw) || string.IsNullOrEmpty(stopsRaw))
+            {
+                return BridgeResponse.Error(400,
+                    "provide ?stops=index:version,index:version,... listing the stops in travel order "
+                    + "(transport stop entities from /city/buildings)");
+            }
+            if (!TryFindPrefabByName(RoutePrefabQuery, prefabName, out Entity prefabEntity, out PrefabBase prefab))
+            {
+                return BridgeResponse.Error(404, $"unknown transport line prefab '{prefabName}'; search via /prefabs?category=route");
+            }
+            if (IsLocked(prefabEntity) && !IsForced(request))
+            {
+                return BridgeResponse.Error(409, $"prefab '{prefab.name}' is locked (milestone not reached); pass force=true to build anyway");
+            }
+
+            string[] parts = stopsRaw.Split(',');
+            var stops = new List<Entity>();
+            foreach (string part in parts)
+            {
+                string trimmed = part.Trim();
+                if (trimmed.Length == 0)
+                {
+                    continue;
+                }
+                string[] pair = trimmed.Split(':');
+                if (pair.Length != 2
+                    || !int.TryParse(pair[0], out int index)
+                    || !int.TryParse(pair[1], out int version))
+                {
+                    return BridgeResponse.Error(400, $"stop '{trimmed}' is not in index:version form");
+                }
+                var stop = new Entity { Index = index, Version = version };
+                if (!EntityManager.Exists(stop))
+                {
+                    return BridgeResponse.Error(404, $"stop entity {trimmed} does not exist");
+                }
+                stops.Add(stop);
+            }
+            if (stops.Count < 2)
+            {
+                return BridgeResponse.Error(400, $"a line needs at least 2 stops, got {stops.Count}");
+            }
+
+            BridgeToolSystem tool = World.GetOrCreateSystemManaged<BridgeToolSystem>();
+            if (!tool.TryQueueRoute(prefabEntity, prefab, stops.ToArray(), request))
+            {
+                return BridgeResponse.Error(409, "another build operation is in progress, retry shortly");
+            }
+            return null;
+        }
+
+        private BridgeResponse ListRoutes(BridgeRequest request)
+        {
+            if (!TryGetCity(out _, out BridgeResponse error))
+            {
+                return error;
+            }
+
+            PrefabSystem prefabSystem = World.GetOrCreateSystemManaged<PrefabSystem>();
+            var results = new List<object>();
+            using (EntityQuery query = EntityManager.CreateEntityQuery(
+                ComponentType.ReadOnly<Game.Routes.Route>(),
+                ComponentType.ReadOnly<Game.Routes.TransportLine>()))
+            using (NativeArray<Entity> entities = query.ToEntityArray(Allocator.Temp))
+            {
+                foreach (Entity entity in entities)
+                {
+                    Game.Routes.TransportLine line = EntityManager.GetComponentData<Game.Routes.TransportLine>(entity);
+                    string name = "<unknown>";
+                    if (EntityManager.HasComponent<PrefabRef>(entity))
+                    {
+                        PrefabBase prefab = prefabSystem.GetPrefab<PrefabBase>(
+                            EntityManager.GetComponentData<PrefabRef>(entity).m_Prefab);
+                        name = prefab != null ? prefab.name : name;
+                    }
+
+                    int stops = EntityManager.HasBuffer<Game.Routes.RouteWaypoint>(entity)
+                        ? EntityManager.GetBuffer<Game.Routes.RouteWaypoint>(entity, isReadOnly: true).Length
+                        : 0;
+                    int vehicles = EntityManager.HasBuffer<Game.Routes.RouteVehicle>(entity)
+                        ? EntityManager.GetBuffer<Game.Routes.RouteVehicle>(entity, isReadOnly: true).Length
+                        : 0;
+
+                    results.Add(new
+                    {
+                        entity = new { index = entity.Index, version = entity.Version },
+                        prefab = name,
+                        stops,
+                        vehicles,
+                        vehicleInterval = line.m_VehicleInterval,
+                        ticketPrice = line.m_TicketPrice,
+                        notEnoughVehicles =
+                            (line.m_Flags & Game.Routes.TransportLineFlags.NotEnoughVehicles) != 0,
+                        waiting = ReadWaitingPassengers(entity),
+                    });
+                }
+            }
+
+            return BridgeResponse.Json(new
+            {
+                count = results.Count,
+                note = "transport lines in the city; waiting sums the passengers queueing at the stops "
+                    + "and their average wait, which is what tells an overloaded line from an idle one",
+                routes = results,
+            });
+        }
+
+        private object ReadWaitingPassengers(Entity route)
+        {
+            if (!EntityManager.HasBuffer<Game.Routes.RouteWaypoint>(route))
+            {
+                return null;
+            }
+            DynamicBuffer<Game.Routes.RouteWaypoint> waypoints =
+                EntityManager.GetBuffer<Game.Routes.RouteWaypoint>(route, isReadOnly: true);
+            int total = 0;
+            int longestWait = 0;
+            for (int i = 0; i < waypoints.Length; i++)
+            {
+                Entity waypoint = waypoints[i].m_Waypoint;
+                if (waypoint == Entity.Null
+                    || !EntityManager.Exists(waypoint)
+                    || !EntityManager.HasComponent<Game.Routes.WaitingPassengers>(waypoint))
+                {
+                    continue;
+                }
+                Game.Routes.WaitingPassengers waiting =
+                    EntityManager.GetComponentData<Game.Routes.WaitingPassengers>(waypoint);
+                total += waiting.m_Count;
+                longestWait = math.max(longestWait, waiting.m_AverageWaitingTime);
+            }
+            return new { passengers = total, longestAverageWait = longestWait };
+        }
+
+        /// <summary>
+        /// Reads startEdge/startSplit (or endEdge/endSplit). Without an explicit
+        /// split the nearest point on that edge to the given coordinate is used,
+        /// which is usually what "join the road here" means.
+        /// </summary>
+        private bool TryResolveAttachment(BridgeRequest request, string which, float3 point,
+            out Entity edge, out float split, out BridgeResponse error)
+        {
+            edge = Entity.Null;
+            split = 0f;
+            error = null;
+
+            if (!request.TryGetInt(which + "Edge", out int index))
+            {
+                return true;
+            }
+            if (!request.TryGetInt(which + "EdgeVersion", out int version))
+            {
+                error = BridgeResponse.Error(400, $"provide ?{which}EdgeVersion= alongside {which}Edge (both from /city/roads)");
+                return false;
+            }
+
+            var candidate = new Entity { Index = index, Version = version };
+            if (!EntityManager.Exists(candidate)
+                || (!EntityManager.HasComponent<Game.Net.Edge>(candidate) && !EntityManager.HasComponent<Game.Net.Node>(candidate)))
+            {
+                error = BridgeResponse.Error(404, $"entity {index}:{version} is not an existing road segment or node");
+                return false;
+            }
+
+            edge = candidate;
+            if (request.TryGetFloat(which + "Split", out float rawSplit))
+            {
+                split = math.clamp(rawSplit, 0f, 1f);
+                return true;
+            }
+            if (EntityManager.HasComponent<Game.Net.Curve>(candidate))
+            {
+                Bezier4x3 curve = EntityManager.GetComponentData<Game.Net.Curve>(candidate).m_Bezier;
+                split = NearestSplit(curve, point);
+            }
+            return true;
+        }
+
+        /// <summary>Position along a curve closest to a world point, sampled then refined.</summary>
+        private static float NearestSplit(Bezier4x3 curve, float3 point)
+        {
+            float best = 0f;
+            float bestDistance = float.MaxValue;
+            const int samples = 32;
+            for (int i = 0; i <= samples; i++)
+            {
+                float t = i / (float)samples;
+                float distance = math.distancesq(MathUtils.Position(curve, t).xz, point.xz);
+                if (distance < bestDistance)
+                {
+                    bestDistance = distance;
+                    best = t;
+                }
+            }
+            float step = 1f / samples;
+            for (int refine = 0; refine < 12; refine++)
+            {
+                step *= 0.5f;
+                foreach (float t in new[] { best - step, best + step })
+                {
+                    float clamped = math.clamp(t, 0f, 1f);
+                    float distance = math.distancesq(MathUtils.Position(curve, clamped).xz, point.xz);
+                    if (distance < bestDistance)
+                    {
+                        bestDistance = distance;
+                        best = clamped;
+                    }
+                }
+            }
+            return best;
         }
 
         private static readonly Dictionary<string, (Game.Prefabs.CompositionFlags.General general, Game.Prefabs.CompositionFlags.Side side)> kUpgradeNames =
